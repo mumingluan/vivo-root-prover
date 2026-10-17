@@ -6,6 +6,8 @@
 
 需要 ARM64、root 和支持模块脚本的管理器。安装 ZIP 后，自动部分仅运行保护服务。模块的操作按钮只检查状态，不清理持久记录。
 
+保护检查间隔为 3 秒。每轮使用一份新扫描的 HAL 进程列表，等待期间阻塞至超时或退出信号，状态文件只在内容变化或被删除时写入。
+
 ```sh
 su -c 'sh /data/adb/modules/vivo-root-prover/proverctl.sh status'
 ```
@@ -22,10 +24,10 @@ su -c 'sh /data/adb/modules/vivo-root-prover/proverctl.sh status'
 
 Windows、Python 3、Android NDK 27、CMake、Ninja。设置 `ANDROID_NDK_HOME`，运行 `python build.py`。构建只编译打包，不连接手机、不执行清理。Capstone 固定来源和原许可证保留在 `vendor/`。
 
-`tests/` 包含主机测试源码，`python test_host.py` 可运行不依赖固件文件的核心和 HAL 映射测试。需要真实固件输入的测试要由使用者自行提供对应样本；仓库不分发固件或设备快照。
+`tests/` 包含主机测试源码，`python test_host.py` 可运行不依赖固件文件的核心和 HAL 映射测试，POSIX 主机还会运行等待与退出信号测试。信号测试也可使用 NDK 编译后在 Android 终端运行。需要真实固件输入的测试要由使用者自行提供对应样本；仓库不分发固件或设备快照。
 
 ## 许可证
 
 原有代码采用 GPL-3.0-only，Copyright (C) 2026 Axuan。第三方代码遵循各自许可证，见 [THIRD_PARTY.md](THIRD_PARTY.md)。
 
-版本 `0.3.2`，包名 / 模块 ID：`vivo-root-prover`。
+版本 `0.3.3`，包名 / 模块 ID：`vivo-root-prover`。

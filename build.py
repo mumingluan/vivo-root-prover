@@ -35,6 +35,6 @@ elif KIND=='root':
     compiler=llvm(n)/('clang++.exe' if WINDOWS else 'clang++');target=ROOT/'module/bin/prover';target.parent.mkdir(exist_ok=True)
     run(compiler,'-ffile-prefix-map='+str(ROOT)+'=.','--target=aarch64-linux-android26','-std=c++17','-O2','-Wall','-Wextra','-Werror','-fPIE','-pie','-fstack-protector-strong','-D_FORTIFY_SOURCE=2','-Wl,-z,relro,-z,now','-static-libstdc++','-I',source/'include',ROOT/'src/prover.cpp',decoder/'libcapstone.a','-o',target)
     run(llvm(n)/('llvm-strip.exe' if WINDOWS else 'llvm-strip'),'--strip-all',target)
-    package_module('vivo-root-prover-0.3.2.zip')
+    package_module('vivo-root-prover-0.3.3.zip')
 else:
     package_module('vivo-extra-dim-range-v1.0.zip')

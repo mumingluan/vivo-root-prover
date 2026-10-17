@@ -6,6 +6,7 @@
 #include "hal_contract.hpp"
 #include "hal_process.hpp"
 #include "block_geometry.hpp"
+#include "watch_wait.hpp"
 #include <cerrno>
 #include <chrono>
 #include <dirent.h>
@@ -139,7 +140,9 @@ static bool setZeroProperty(const char* name) {
 }
 static void zeroProperties(){require(setZeroProperty("persist.sys.is_root"),"resetprop unavailable or root property override failed");if(!property("recovery.state.root").empty())require(setZeroProperty("recovery.state.root"),"recovery property override failed");}
 static std::string linkPath(const std::string& path){char b[4096];ssize_t n=readlink(path.c_str(),b,sizeof(b));return n<0?"":std::string(b,size_t(n));}
-static std::vector<pid_t> halPids(){std::vector<pid_t> pids;DIR* d=opendir("/proc");require(d,"open proc failed");while(auto ent=readdir(d)){char* end=nullptr;long p=strtol(ent->d_name,&end,10);if(!*ent->d_name||*end||p<=1)continue;auto image=linkPath(std::string("/proc/")+ent->d_name+"/exe");if(image==HAL||image==std::string(HAL)+" (deleted)")pids.push_back(pid_t(p));}closedir(d);std::sort(pids.begin(),pids.end());return pids;}
+static bool isHalImage(const std::string& image){static const std::string deleted=std::string(HAL)+" (deleted)";return image==HAL||image==deleted;}
+static void verifyHalPid(pid_t pid){require(isHalImage(linkPath("/proc/"+std::to_string(pid)+"/exe")),"HAL process changed during guard pass");}
+static std::vector<pid_t> halPids(){std::vector<pid_t> pids;DIR* d=opendir("/proc");require(d,"open proc failed");while(auto ent=readdir(d)){char* end=nullptr;long p=strtol(ent->d_name,&end,10);if(!*ent->d_name||*end||p<=1)continue;auto image=linkPath(std::string("/proc/")+ent->d_name+"/exe");if(isHalImage(image))pids.push_back(pid_t(p));}closedir(d);std::sort(pids.begin(),pids.end());return pids;}
 static void enterInitNamespace(){FD init(open("/proc/1/ns/mnt",O_RDONLY|O_CLOEXEC));require(init.fd>=0,error("open init mount namespace"));require(setns(init.fd,CLONE_NEWNS)==0,error("enter init mount namespace"));}
 static bool ownMask(const std::string& target=NODE){struct stat a{},b{};return stat(target.c_str(),&a)==0&&stat((STATE+"/mount-state-zero").c_str(),&b)==0&&a.st_dev==b.st_dev&&a.st_ino==b.st_ino;}
 static std::string nodeRead(int fd){require(lseek(fd,0,SEEK_SET)>=0,error("seek proc node"));char b[64]{};ssize_t n=read(fd,b,63);require(n>0,error("read proc node"));return std::string(b,size_t(n));}
@@ -167,16 +170,43 @@ static void makeMask(int original){auto path=STATE+"/mount-state-zero";if(access
     memset(current,0,sizeof(current));have=fgetxattr(source.fd,"security.selinux",current,sizeof(current));require(have==n&&!memcmp(current,label,size_t(n)),"mask SELinux label readback mismatch");
 }
 static void mountMask(){if(ownMask())return;require(mount((STATE+"/mount-state-zero").c_str(),NODE,nullptr,MS_BIND,nullptr)==0,error("bind proc read view"));if(mount(nullptr,NODE,nullptr,MS_BIND|MS_REMOUNT|MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC,nullptr)){int saved=errno;umount2(NODE,MNT_DETACH);errno=saved;throw std::runtime_error(error("remount proc view readonly"));}require(ownMask()&&trim(textFile(NODE))=="mount state:0","proc view verification failed");}
-static bool halViewsZero(){auto pids=halPids();for(auto p:pids){try{if(trim(textFile("/proc/"+std::to_string(p)+"/root/proc/isroot/isroot"))!="mount state:0")return false;}catch(...){return false;}}return true;}
-static void maskHalNamespaces(){auto pids=halPids();std::set<std::string> visited;visited.insert(linkPath("/proc/self/ns/mnt"));for(auto p:pids){auto ns="/proc/"+std::to_string(p)+"/ns/mnt";auto name=linkPath(ns);if(name.empty()||!visited.insert(name).second)continue;pid_t child=fork();require(child>=0,"fork namespace helper failed");if(!child){try{FD fd(open(ns.c_str(),O_RDONLY|O_CLOEXEC));require(fd.fd>=0&&setns(fd.fd,CLONE_NEWNS)==0,"HAL namespace unavailable");mountMask();_exit(0);}catch(...){_exit(1);}}int status=0;while(waitpid(child,&status,0)<0&&errno==EINTR){}require(WIFEXITED(status)&&WEXITSTATUS(status)==0,"HAL namespace mask failed");}require(halViewsZero(),"HAL still sees a root signal");}
-static bool hasOwnedMasks(){if(ownMask())return true;for(auto pid:halPids())if(ownMask("/proc/"+std::to_string(pid)+"/root/proc/isroot/isroot"))return true;return false;}
-static void removeOwnedMasks(){if(ownMask())require(umount2(NODE,MNT_DETACH)==0,error("remove owned proc mask"));for(auto pid:halPids()){auto view="/proc/"+std::to_string(pid)+"/root/proc/isroot/isroot";if(!ownMask(view))continue;FD ns(open(("/proc/"+std::to_string(pid)+"/ns/mnt").c_str(),O_RDONLY|O_CLOEXEC));require(ns.fd>=0&&setns(ns.fd,CLONE_NEWNS)==0,"enter HAL namespace for unmask failed");try{if(ownMask())require(umount2(NODE,MNT_DETACH)==0,"HAL unmask failed");}catch(...){enterInitNamespace();throw;}enterInitNamespace();}}
-static std::string guard(int fd){
+static bool halViewsZero(const std::vector<pid_t>& pids=halPids()){for(auto p:pids){try{verifyHalPid(p);if(trim(textFile("/proc/"+std::to_string(p)+"/root/proc/isroot/isroot"))!="mount state:0")return false;}catch(...){return false;}}return true;}
+static void maskHalNamespaces(const std::vector<pid_t>& pids=halPids()){
+    std::set<std::string> visited;visited.insert(linkPath("/proc/self/ns/mnt"));
+    for(auto p:pids){
+        verifyHalPid(p);
+        auto ns="/proc/"+std::to_string(p)+"/ns/mnt";auto name=linkPath(ns);
+        if(name.empty()||!visited.insert(name).second)continue;
+        pid_t child=fork();require(child>=0,"fork namespace helper failed");
+        if(!child){try{FD fd(open(ns.c_str(),O_RDONLY|O_CLOEXEC));require(fd.fd>=0&&setns(fd.fd,CLONE_NEWNS)==0,"HAL namespace unavailable");mountMask();_exit(0);}catch(...){_exit(1);}}
+        int status=0;while(waitpid(child,&status,0)<0&&errno==EINTR){}
+        require(WIFEXITED(status)&&WEXITSTATUS(status)==0,"HAL namespace mask failed");
+    }
+    require(halViewsZero(pids),"HAL still sees a root signal");
+}
+static bool hasOwnedMasks(const std::vector<pid_t>& pids=halPids()){
+    if(ownMask())return true;
+    for(auto pid:pids){verifyHalPid(pid);if(ownMask("/proc/"+std::to_string(pid)+"/root/proc/isroot/isroot"))return true;}
+    return false;
+}
+static void removeOwnedMasks(const std::vector<pid_t>& pids=halPids()){
+    if(ownMask())require(umount2(NODE,MNT_DETACH)==0,error("remove owned proc mask"));
+    for(auto pid:pids){
+        verifyHalPid(pid);
+        auto view="/proc/"+std::to_string(pid)+"/root/proc/isroot/isroot";
+        if(!ownMask(view))continue;
+        FD ns(open(("/proc/"+std::to_string(pid)+"/ns/mnt").c_str(),O_RDONLY|O_CLOEXEC));
+        require(ns.fd>=0&&setns(ns.fd,CLONE_NEWNS)==0,"enter HAL namespace for unmask failed");
+        try{if(ownMask())require(umount2(NODE,MNT_DETACH)==0,"HAL unmask failed");}catch(...){enterInitNamespace();throw;}
+        enterInitNamespace();
+    }
+}
+static std::string guard(int fd,const std::vector<pid_t>& pids=halPids()){
     ProcViewOps ops{
         [&]{gates(fd);},[&]{return trim(nodeRead(fd));},
-        []{return hasOwnedMasks();},[]{removeOwnedMasks();},
-        [&]{makeMask(fd);mountMask();maskHalNamespaces();},
-        []{return trim(textFile(NODE))=="mount state:0"&&halViewsZero();}
+        [&]{return hasOwnedMasks(pids);},[&]{removeOwnedMasks(pids);},
+        [&]{makeMask(fd);mountMask();maskHalNamespaces(pids);},
+        [&]{return trim(textFile(NODE))=="mount state:0"&&halViewsZero(pids);}
     };
     auto mode=maintain_proc_view(ops);zeroProperties();return mode;
 }
@@ -302,12 +332,17 @@ static void status(){bool supported=false;std::string reason;try{profile();suppo
 static void watch(const std::string& module){profile();initState();FD lock(open((STATE+"/guard.lock").c_str(),O_RDWR|O_CREAT|O_NOFOLLOW|O_CLOEXEC,0600));require(lock.fd>=0,"open guard lock failed");if(flock(lock.fd,LOCK_EX|LOCK_NB))return;require(module.rfind("/data/adb/modules/",0)==0&&module.find("..") ==std::string::npos,"unexpected module path");
     FD pidFile(open((STATE+"/guard.pid").c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC,0600));require(pidFile.fd>=0,"write guard PID failed");auto pidText=std::to_string(getpid())+"\n";writeAt(pidFile.fd,0,Bytes(pidText.begin(),pidText.end()));
     enterInitNamespace();FD node(originalNode());signal(SIGTERM,stopSignal);signal(SIGINT,stopSignal);unsigned step=0;
+    std::string writtenStatus;bool statusWritten=false;const auto statusPath=STATE+"/guard-status.txt";
     while(!stopRequested&&access((module+"/disable").c_str(),F_OK)&&access((module+"/remove").c_str(),F_OK)){
-        std::string result;try{auto mode=guard(node.fd);result="protection=active\nproc_view_mode="+mode+"\ngates=commands_accepted_not_independently_observable\nunderlying_proc="+trim(nodeRead(node.fd))+"\nvisible_proc="+trim(textFile(NODE))+"\nHAL_views_zero="+(halViewsZero()?"true":"false")+"\n";}catch(const std::exception& e){result="protection=degraded\nreason="+std::string(e.what())+"\n";}
-        // Only root-owned runtime metadata is overwritten here.
-        FD f(open((STATE+"/guard-status.txt").c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC,0600));if(f.fd>=0){Bytes b(result.begin(),result.end());writeAt(f.fd,0,b);}
+        // A fresh PID snapshot for every pass; never retain it across intervals.
+        std::string result;try{const auto pids=halPids();auto mode=guard(node.fd,pids);result="protection=active\nproc_view_mode="+mode+"\ngates=commands_accepted_not_independently_observable\nunderlying_proc="+trim(nodeRead(node.fd))+"\nvisible_proc="+trim(textFile(NODE))+"\nHAL_views_zero="+(halViewsZero(pids)?"true":"false")+"\n";}catch(const std::exception& e){result="protection=degraded\nreason="+std::string(e.what())+"\n";}
+        // Stable state needs no disk write. Recreate a removed status file.
+        if(!statusWritten||result!=writtenStatus||access(statusPath.c_str(),F_OK)!=0){
+            FD f(open(statusPath.c_str(),O_WRONLY|O_CREAT|O_TRUNC|O_NOFOLLOW|O_CLOEXEC,0600));
+            if(f.fd>=0){Bytes b(result.begin(),result.end());writeAt(f.fd,0,b);writtenStatus=result;statusWritten=true;}
+        }
         if(step++%20==0)std::cout<<result<<std::flush;
-        for(int i=0;i<30&&!stopRequested;++i)usleep(100000);
+        wait_guard_interval(stopRequested,std::chrono::seconds(3));
     }
 }
 static void unmask(){profile();enterInitNamespace();removeOwnedMasks();}
