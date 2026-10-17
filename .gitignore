@@ -1,0 +1,27 @@
+# Local build and device data
+/build/
+/dist/
+/artifacts/
+/history/
+/installation/
+/.gradle/
+/.kotlin/
+/.tmp/
+/.jvm-tmp/
+**/__pycache__/
+**/build/
+*.log
+*.apk
+*.idsig
+*.zip
+*.exe
+*.class
+*.dex
+*.jks
+*.keystore
+*.pem
+*.key
+local.properties
+.env*
+/module/bin/
+/module/zygisk/

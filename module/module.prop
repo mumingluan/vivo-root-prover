@@ -1,0 +1,6 @@
+id=vivo-root-prover
+name=vivo Root Prover
+version=0.3.2
+versionCode=9
+author=Axuan
+description=Block verified vivo mount-root recording; inspect and explicitly clean NV/log records with checked recovery snapshots.
